@@ -7,9 +7,9 @@ name = "pypi"
 torch = "*"
 torchvision = "*"
 tqdm = "*"
-compressai = "*"
 timm = "*"
 wandb = "*"
+compressai = "*"
 
 [dev-packages]
 
