@@ -15,8 +15,8 @@ from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
 from models import TCM
-from torch.utils.tensorboard import SummaryWriter   
 import os
+import wandb
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
@@ -117,6 +117,7 @@ def train_one_epoch(
 ):
     model.train()
     device = next(model.parameters()).device
+    steps_per_epoch = len(train_dataloader)
 
     for i, d in enumerate(train_dataloader):
         d = d.to(device)
@@ -134,6 +135,18 @@ def train_one_epoch(
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
+
+        log_data = {
+            "train/loss": out_criterion["loss"].item(),
+            "train/bpp_loss": out_criterion["bpp_loss"].item(),
+            "train/aux_loss": aux_loss.item(),
+        }
+        if type == 'mse':
+            log_data["train/mse_loss"] = out_criterion["mse_loss"].item()
+        else:
+            log_data["train/ms_ssim_loss"] = out_criterion["ms_ssim_loss"].item()
+        global_step = epoch * steps_per_epoch + i
+        wandb.log(log_data, step=global_step)
 
         if i % 1000 == 0:
             if type == 'mse':
@@ -321,13 +334,16 @@ def main(argv):
         print(arg, ":", getattr(args, arg))
     type = args.type
     save_path = os.path.join(args.save_path, str(args.lmbda))
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-        os.makedirs(save_path + "tensorboard/")
+    os.makedirs(save_path, exist_ok=True)
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
-    writer = SummaryWriter(save_path + "tensorboard/")
+    wandb_project = os.environ.get("WANDB_PROJECT", "LIC_TCM")
+    wandb_run = wandb.init(
+        project=wandb_project,
+        config=vars(args),
+        name=f"lambda_{args.lmbda}_N_{args.N}",
+    )
 
     train_transforms = transforms.Compose(
         [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
@@ -363,6 +379,7 @@ def main(argv):
 
     net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
     net = net.to(device)
+    wandb.watch(net, log="all", log_freq=100)
 
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
@@ -399,7 +416,7 @@ def main(argv):
             type
         )
         loss = test_epoch(epoch, test_dataloader, net, criterion, type)
-        writer.add_scalar('test_loss', loss, epoch)
+        wandb.log({"test_loss": loss, "epoch": epoch})
         lr_scheduler.step()
 
         is_best = loss < best_loss
@@ -421,6 +438,7 @@ def main(argv):
                 save_path + str(epoch) + "_checkpoint.pth.tar",
             )
 
+    wandb_run.finish()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
