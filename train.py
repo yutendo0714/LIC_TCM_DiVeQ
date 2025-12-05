@@ -27,27 +27,32 @@ def compute_msssim(a, b):
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
-    def __init__(self, lmbda=1e-2, type='mse'):
+    def __init__(self, lmbda=1e-2, type='mse', vq_weight=1.0):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.type = type
+        self.vq_weight = vq_weight
 
     def forward(self, output, target):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
 
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
+        out["bpp_loss"] = 0
+        for likelihoods in output["likelihoods"].values():
+            safe_likelihoods = likelihoods.clamp(min=1e-9)
+            out["bpp_loss"] += torch.log(safe_likelihoods).sum() / (-math.log(2) * num_pixels)
         if self.type == 'mse':
             out["mse_loss"] = self.mse(output["x_hat"], target)
             out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
         else:
             out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
             out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+        if "vq_loss" in output:
+            out["vq_loss"] = output["vq_loss"]
+            if output["vq_loss"] is not None:
+                out["loss"] = out["loss"] + self.vq_weight * output["vq_loss"]
 
         return out
 
@@ -145,10 +150,15 @@ def train_one_epoch(
             log_data["train/mse_loss"] = out_criterion["mse_loss"].item()
         else:
             log_data["train/ms_ssim_loss"] = out_criterion["ms_ssim_loss"].item()
+        if "vq_loss" in out_criterion:
+            log_data["train/vq_loss"] = out_criterion["vq_loss"].item()
         global_step = epoch * steps_per_epoch + i
         wandb.log(log_data, step=global_step)
 
         if i % 1000 == 0:
+            vq_info = ""
+            if "vq_loss" in out_criterion:
+                vq_info = f'\tVQ loss: {out_criterion["vq_loss"].item():.3f} |'
             if type == 'mse':
                 print(
                     f"Train epoch {epoch}: ["
@@ -158,6 +168,7 @@ def train_one_epoch(
                     f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                     f"\tAux loss: {aux_loss.item():.2f}"
+                    f"{vq_info}"
                 )
             else:
                 print(
@@ -168,12 +179,14 @@ def train_one_epoch(
                     f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                     f"\tAux loss: {aux_loss.item():.2f}"
+                    f"{vq_info}"
                 )
 
 
 def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
     model.eval()
     device = next(model.parameters()).device
+    vq_loss_meter = AverageMeter()
     if type == 'mse':
         loss = AverageMeter()
         bpp_loss = AverageMeter()
@@ -190,13 +203,20 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
                 bpp_loss.update(out_criterion["bpp_loss"])
                 loss.update(out_criterion["loss"])
                 mse_loss.update(out_criterion["mse_loss"])
+                if "vq_loss" in out_criterion:
+                    vq_loss_meter.update(out_criterion["vq_loss"].item())
 
+        vq_text = ""
+        if vq_loss_meter.count > 0:
+            vq_text = f"\tVQ loss: {vq_loss_meter.avg:.3f} |"
         print(
             f"Test epoch {epoch}: Average losses:"
             f"\tLoss: {loss.avg:.3f} |"
             f"\tMSE loss: {mse_loss.avg:.3f} |"
             f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tAux loss: {aux_loss.avg:.2f} |"
+            f"{vq_text}"
+            f"\n"
         )
 
     else:
@@ -215,16 +235,27 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
                 bpp_loss.update(out_criterion["bpp_loss"])
                 loss.update(out_criterion["loss"])
                 ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+                if "vq_loss" in out_criterion:
+                    vq_loss_meter.update(out_criterion["vq_loss"].item())
 
+        vq_text = ""
+        if vq_loss_meter.count > 0:
+            vq_text = f"\tVQ loss: {vq_loss_meter.avg:.3f} |"
         print(
             f"Test epoch {epoch}: Average losses:"
             f"\tLoss: {loss.avg:.3f} |"
             f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
             f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tAux loss: {aux_loss.avg:.2f} |"
+            f"{vq_text}"
+            f"\n"
         )
 
-    return loss.avg
+    metrics = {}
+    if vq_loss_meter.count > 0:
+        metrics["test_vq_loss"] = vq_loss_meter.avg
+
+    return loss.avg, metrics
 
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
@@ -324,6 +355,38 @@ def parse_args(argv):
     parser.add_argument(
         "--continue_train", action="store_true", default=True
     )
+    parser.add_argument(
+        "--vq-type", type=str, default="diveq", choices=["diveq", "sfdiveq"],
+        help="Type of VQ module to use for latent quantization"
+    )
+    parser.add_argument(
+        "--vq-codebook-size", type=int, default=512,
+        help="Codebook size for the VQ modules"
+    )
+    parser.add_argument(
+        "--vq-sigma-sq", type=float, default=1e-3,
+        help="Directional noise variance for DiVeQ"
+    )
+    parser.add_argument(
+        "--sf-sigma-sq", type=float, default=1e-2,
+        help="Directional noise variance for SF-DiVeQ"
+    )
+    parser.add_argument(
+        "--vq-commitment-cost", type=float, default=0.25,
+        help="Commitment loss weight for the VQ modules"
+    )
+    parser.add_argument(
+        "--vq-loss-weight", type=float, default=1.0,
+        help="Multiplier applied to the VQ loss in the RD objective"
+    )
+    parser.add_argument(
+        "--vq-warmup-steps", type=int, default=0,
+        help="Number of training steps to skip quantization for SF-DiVeQ warmup"
+    )
+    parser.add_argument(
+        "--sf-init-warmup-epochs", type=int, default=2,
+        help="Number of warmup epochs for initializing SF-DiVeQ codebooks"
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -377,7 +440,20 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+    net = TCM(
+        config=[2,2,2,2,2,2],
+        head_dim=[8, 16, 32, 32, 16, 8],
+        drop_path_rate=0.0,
+        N=args.N,
+        M=320,
+        vq_type=args.vq_type,
+        codebook_size=args.vq_codebook_size,
+        vq_sigma_squared=args.vq_sigma_sq,
+        sf_sigma_squared=args.sf_sigma_sq,
+        vq_commitment_cost=args.vq_commitment_cost,
+        vq_warmup_steps=args.vq_warmup_steps,
+        sf_init_warmup_epochs=args.sf_init_warmup_epochs,
+    )
     net = net.to(device)
     wandb.watch(net, log="all", log_freq=100)
 
@@ -389,7 +465,7 @@ def main(argv):
     print("milestones: ", milestones)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
+    criterion = RateDistortionLoss(lmbda=args.lmbda, type=type, vq_weight=args.vq_loss_weight)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
@@ -415,8 +491,10 @@ def main(argv):
             args.clip_max_norm,
             type
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion, type)
-        wandb.log({"test_loss": loss, "epoch": epoch})
+        loss, eval_metrics = test_epoch(epoch, test_dataloader, net, criterion, type)
+        test_log = {"test_loss": loss, "epoch": epoch}
+        test_log.update(eval_metrics)
+        wandb.log(test_log)
         lr_scheduler.step()
 
         is_best = loss < best_loss
