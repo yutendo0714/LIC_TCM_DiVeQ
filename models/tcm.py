@@ -21,6 +21,7 @@ from einops.layers.torch import Rearrange
 from timm.models.layers import trunc_normal_, DropPath
 import numpy as np
 import math
+import .dievq import DiVeQ, SFDiVeQ
 
 
 SCALES_MIN = 0.11
