@@ -590,11 +590,12 @@ class TCM(CompressionModel):
 
     def _build_categorical_cdf(self, logits):
         symbol_dim = logits.size(1)
+        total = max(int(self.cdf_total), int(symbol_dim) + 1)
         probs = torch.softmax(logits, dim=1)
         probs = probs.permute(0, 2, 3, 1).contiguous()
         flat = probs.view(-1, symbol_dim).detach()
-        total = self.cdf_total
-        scaled = flat * (total - symbol_dim)
+        spread = total - symbol_dim
+        scaled = flat * spread
         base = torch.floor(scaled)
         counts = (base + 1).long()
         remainder = (total - counts.sum(dim=1)).long()
