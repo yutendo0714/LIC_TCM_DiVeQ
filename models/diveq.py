@@ -373,6 +373,7 @@ class SFDiVeQ(nn.Module):
         z: torch.Tensor,
         return_loss: bool = True,
         skip_quantization: bool = False,
+        lambda_pairs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         Forward pass with SF-DiVeQ quantization
@@ -402,8 +403,15 @@ class SFDiVeQ(nn.Module):
         
         # Generate dithered codebook by interpolating consecutive codewords
         # Sample interpolation factors λ ~ U(0, 1)
-        lambda_vals = torch.rand(self.num_embeddings - 1, 1, 
-                                 device=z.device, dtype=z.dtype)  # [K-1, 1]
+        if lambda_pairs is not None:
+            if lambda_pairs.dim() == 1:
+                lambda_pairs = lambda_pairs.unsqueeze(-1)
+            if lambda_pairs.shape[0] != self.num_embeddings - 1 or lambda_pairs.shape[1] != 1:
+                raise ValueError("lambda_pairs has incompatible length.")
+            lambda_vals = lambda_pairs.to(z.device, z.dtype)
+        else:
+            lambda_vals = torch.rand(self.num_embeddings - 1, 1, 
+                                     device=z.device, dtype=z.dtype)  # [K-1, 1]
         
         # Create dithered codewords: c_d = (1-λ)·c_i + λ·c_{i+1}
         c_i = self.codebook.weight[:-1]  # [K-1, D]
@@ -412,12 +420,12 @@ class SFDiVeQ(nn.Module):
         
         # Find nearest dithered codeword
         distances = torch.cdist(flat_input, dithered_codebook)  # [N, K-1]
-        indices = torch.argmin(distances, dim=1)  # [N]
+        flat_indices = torch.argmin(distances, dim=1)  # [N]
         
         # Get the two base codewords for each sample
-        c_i_star = self.codebook.weight[indices]  # [N, D]
-        c_i_star_plus_1 = self.codebook.weight[indices + 1]  # [N, D]
-        lambda_i_star = lambda_vals[indices].squeeze(-1)  # [N]
+        c_i_star = self.codebook.weight[flat_indices]  # [N, D]
+        c_i_star_plus_1 = self.codebook.weight[flat_indices + 1]  # [N, D]
+        lambda_i_star = lambda_vals[flat_indices].squeeze(-1)  # [N]
         
         # Compute directional vectors
         d_i = c_i_star - flat_input  # [N, D]
@@ -451,13 +459,13 @@ class SFDiVeQ(nn.Module):
         
         # Reshape back to original shape
         z_q = z_q.reshape(input_shape)
-        indices = indices.reshape(input_shape[:-1])
+        indices = flat_indices.reshape(input_shape[:-1])
         
         # Compute loss
         loss = None
         if return_loss:
             # For SF-DiVeQ, compute loss w.r.t. dithered codewords
-            dithered_targets = dithered_codebook[indices]
+            dithered_targets = dithered_codebook[flat_indices]
             
             # Codebook loss
             codebook_loss = F.mse_loss(dithered_targets, flat_input.detach())

@@ -620,6 +620,18 @@ class TCM(CompressionModel):
         cdf[:, 1:] = torch.cumsum(counts, dim=1)
         cdf[:, -1] = total
         return np.ascontiguousarray(cdf.numpy())
+
+    def _sample_lambda_pairs(self, generator, device, dtype):
+        if generator is None:
+            raise RuntimeError("Lambda generator is not initialized.")
+        values = torch.rand(
+            self.codebook_size - 1,
+            1,
+            generator=generator,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        return values.to(device=device, dtype=dtype)
     
     def forward(self, x):
         y = self.g_a(x)
@@ -708,8 +720,6 @@ class TCM(CompressionModel):
         return net
 
     def compress(self, x):
-        if self.vq_type != "diveq":
-            raise NotImplementedError("Compression is currently implemented only for DiVeQ.")
         if x.size(0) != 1:
             raise ValueError("Compression only supports batch size 1.")
         with torch.no_grad():
@@ -725,6 +735,12 @@ class TCM(CompressionModel):
             y_slices = y.chunk(self.num_slices, 1)
             y_hat_slices = []
             encoder = CategoricalArithmeticEncoder(self.categorical_coder_precision)
+            lambda_seed = None
+            lambda_gen = None
+            if self.vq_type == "sfdiveq":
+                lambda_seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+                lambda_gen = torch.Generator(device="cpu")
+                lambda_gen.manual_seed(lambda_seed)
 
             for slice_index, y_slice in enumerate(y_slices):
                 support_slices = (
@@ -741,7 +757,12 @@ class TCM(CompressionModel):
                 logits = logits[:, :, :y_shape[0], :y_shape[1]]
 
                 centered = (y_slice - mu).permute(0, 2, 3, 1)
-                quantized_residual, _, indices = self.vq_layers[slice_index](centered, return_loss=False)
+                lambda_pairs = None
+                if self.vq_type == "sfdiveq":
+                    lambda_pairs = self._sample_lambda_pairs(lambda_gen, centered.device, centered.dtype)
+                quantized_residual, _, indices = self.vq_layers[slice_index](
+                    centered, return_loss=False, lambda_pairs=lambda_pairs
+                )
                 indices_np = indices.view(-1).cpu().numpy()
                 cdf = self._build_categorical_cdf(logits)
                 cdf_rows = cdf.reshape(-1, cdf.shape[-1])
@@ -757,19 +778,30 @@ class TCM(CompressionModel):
                 y_hat_slices.append(y_hat_slice)
 
             y_string = encoder.flush()
+            y_payload = [y_string]
+            if lambda_seed is not None:
+                y_payload.append(int(lambda_seed).to_bytes(8, byteorder="little", signed=False))
 
-        return {"strings": [[y_string], z_strings], "shape": z.size()[-2:]}
+        return {"strings": [y_payload, z_strings], "shape": z.size()[-2:]}
 
     def decompress(self, strings, shape):
-        if self.vq_type != "diveq":
-            raise NotImplementedError("Decompression is currently implemented only for DiVeQ.")
         with torch.no_grad():
             z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
             latent_scales = self.h_scale_s(z_hat)
             latent_means = self.h_mean_s(z_hat)
 
             y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
-            decoder = CategoricalArithmeticDecoder(strings[0][0], precision=self.categorical_coder_precision)
+            y_payload = strings[0]
+            if not isinstance(y_payload, (list, tuple)) or len(y_payload) == 0:
+                raise ValueError("Invalid bitstream payload.")
+            decoder = CategoricalArithmeticDecoder(y_payload[0], precision=self.categorical_coder_precision)
+            lambda_gen = None
+            if self.vq_type == "sfdiveq":
+                if len(y_payload) < 2:
+                    raise ValueError("Missing lambda seed for SF-DiVeQ stream.")
+                lambda_seed = int.from_bytes(y_payload[1], byteorder="little", signed=False)
+                lambda_gen = torch.Generator(device="cpu")
+                lambda_gen.manual_seed(lambda_seed)
 
             y_hat_slices = []
             device = latent_means.device
@@ -796,9 +828,21 @@ class TCM(CompressionModel):
                 indices = torch.from_numpy(decoded).to(device).view(1, y_shape[0], y_shape[1])
 
                 codebook = self.vq_layers[slice_index].codebook.weight
-                quantized_flat = F.embedding(indices.view(-1), codebook).view(
-                    1, y_shape[0], y_shape[1], -1
-                )
+                lambda_pairs = None
+                if self.vq_type == "sfdiveq":
+                    lambda_pairs = self._sample_lambda_pairs(lambda_gen, device, latent_means.dtype)
+                indices_flat = indices.view(-1)
+                if self.vq_type == "sfdiveq":
+                    if lambda_pairs is None:
+                        raise RuntimeError("Lambda pairs are required for SF-DiVeQ.")
+                    lambda_selected = lambda_pairs[indices_flat].to(device)
+                    c_i = codebook[indices_flat]
+                    c_i_plus = codebook[indices_flat + 1]
+                    quantized_flat = (1.0 - lambda_selected) * c_i + lambda_selected * c_i_plus
+                else:
+                    quantized_flat = F.embedding(indices_flat, codebook)
+
+                quantized_flat = quantized_flat.view(1, y_shape[0], y_shape[1], -1)
                 quantized_residual = quantized_flat.permute(0, 3, 1, 2)
                 y_hat_slice = mu + quantized_residual
 
